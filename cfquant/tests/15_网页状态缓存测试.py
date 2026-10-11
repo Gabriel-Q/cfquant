@@ -372,7 +372,7 @@ def test_auto_deploy_local_core_skips_when_target_matches(tmp_path):
 def test_local_entry_sync_overwrites_bound_qmt_python_script(tmp_path):
     source = tmp_path / "source"
     (source / "qmt_scripts").mkdir(parents=True)
-    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b"new-entry\n")
+    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b'LITE_ENTRY_VERSION = "test"\n')
     qmt_root = tmp_path / "QMT"
     (qmt_root / "bin.x64").mkdir(parents=True)
     (qmt_root / "python").mkdir()
@@ -389,7 +389,7 @@ def test_local_entry_sync_overwrites_bound_qmt_python_script(tmp_path):
     )
 
     assert result["updated"] is True
-    assert entry.read_bytes() == b"new-entry\n"
+    assert entry.read_bytes() == b'LITE_ENTRY_VERSION = "test"\n'
     assert result["entry_file"] == str(entry)
     assert result["backup"]
     assert (qmt_root / "bin.x64" / ".cfquant_updates" / "entry_backups").is_dir()
@@ -402,7 +402,7 @@ def test_auto_deploy_project_update_copies_bound_mode_entry(tmp_path, monkeypatc
     for name in ("__init__.py", "client.py", "protocol.py"):
         (source_core / name).write_text("# source\n", encoding="utf-8")
     (source / "qmt_scripts").mkdir()
-    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b"latest-lite\n")
+    (source / "qmt_scripts" / "CFQUANT_LITE.py").write_bytes(b'LITE_ENTRY_VERSION = "latest"\n')
 
     qmt_root = tmp_path / "QMT"
     target_core = qmt_root / "bin.x64" / "cfquant"
@@ -423,7 +423,7 @@ def test_auto_deploy_project_update_copies_bound_mode_entry(tmp_path, monkeypatc
 
     assert result["summary"]["ok"] is True
     assert result["summary"]["entry_updated_count"] == 1
-    assert (qmt_root / "python" / "CFQUANT_LITE.py").read_bytes() == b"latest-lite\n"
+    assert (qmt_root / "python" / "CFQUANT_LITE.py").read_bytes() == b'LITE_ENTRY_VERSION = "latest"\n'
     assert result["results"][0]["entry_script"] == "CFQUANT_LITE.py"
 
 

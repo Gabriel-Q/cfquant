@@ -282,8 +282,9 @@ def test_save_and_delete_call_deployment_manager(web_config, monkeypatch):
     class Manager:
         def reconcile(self, accounts):
             calls.append(("reconcile", set(accounts)))
-        def configure(self, row, identities, force=False):
+        def configure(self, row, identities, force=False, scripts_dir=None):
             assert force is True
+            assert scripts_dir == os.path.join(web.BASE_DIR, "qmt_scripts")
             calls.append(("configure", row["qmt_strategy"], identities))
             return {"enabled": True, "targets": [{"state": "waiting_exit"}]}
     monkeypatch.setattr(web, "QMT_STRATEGIES", Manager())

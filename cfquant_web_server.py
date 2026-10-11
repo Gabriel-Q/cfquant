@@ -109,7 +109,8 @@ from cfquant.batch_orders import (
 )
 from cfquant import _editable_install
 from cfquant import xtconstant as cf_xtconstant
-from cfquant.qmt_strategy_deploy import QmtStrategyManager, account_qmt_roots, normalize_strategy_settings, qmt_root
+from cfquant.qmt_strategy_deploy import (QmtStrategyManager, account_qmt_roots,
+    normalize_strategy_settings, qmt_root, entry_script_for_mode, read_entry_source)
 from cfquant.channels import configured_bridges, normalize_bridge_id
 from cfquant.config import get_config as get_cfquant_config
 from cfquant.logging_i18n import normalize_log_enabled, normalize_log_language
@@ -561,19 +562,7 @@ QMT_ENTRY_SCRIPT_NAMES = (
 
 def qmt_entry_script_name_for_target(mode, qmt_role="normal", market=""):
     """Return the source entry script used by a saved QMT binding target."""
-    mode = normalize_transport_mode(mode or "ctypes")
-    qmt_role = str(qmt_role or "normal").strip().lower()
-    market = str(market or "").strip().upper()
-    if mode == "lttx":
-        stem = "CFQUANT_TRADE_LOWLAT" if qmt_role != "normal" else "CFQUANT"
-    elif mode == "lite":
-        stem = "CFQUANT_LITE"
-    else:
-        stem = "CFQUANT_CTYPE_ALL_LOWLAT"
-    filename = stem + ("_%s" % market if market else "") + ".py"
-    if market:
-        return os.path.join("\u540c\u8d26\u53f7\u72ec\u7acb\u5e02\u573a", filename)
-    return filename
+    return entry_script_for_mode(mode, str(qmt_role or "normal").strip().lower(), market)
 
 
 WEB_BOUND_HOST = None
@@ -2706,7 +2695,7 @@ class WebRuntimeConfig(object):
         display_name=None,
         qmt_dir=None,
         qmt_trade_dir=None,
-        mode="ctypes",
+        mode=None,
         data_provider=False,
         enabled=True,
         market_routing_enabled=None,
@@ -2721,23 +2710,25 @@ class WebRuntimeConfig(object):
         display_name = None if display_name is None else str(display_name).strip()
         qmt_dir = normalize_optional_path(qmt_dir)
         qmt_trade_dir = normalize_optional_path(qmt_trade_dir)
-        mode = normalize_transport_mode(mode)
         enabled = parse_config_bool(enabled, True) if enabled is not None else None
-        if mode == "lttx" and enabled is not False:
-            if not qmt_dir:
-                raise ValueError("高级模式需要填写普通 QMT 核心目录")
-            if not qmt_trade_dir:
-                raise ValueError("高级模式需要填写极速交易端 QMT 核心目录")
-            if os.path.normcase(str(qmt_root(qmt_dir))) == os.path.normcase(str(qmt_root(qmt_trade_dir))):
-                raise ValueError("高级模式的两个 QMT 核心目录必须不同")
-        if mode != "lttx":
-            qmt_trade_dir = ""
         now = time.time()
         with self._lock:
             configs = self._data.setdefault("account_configs", {})
             bridge_id = self._account_bridge_id_locked(account_id, account_type, bridge_id, qmt_dir)
             account_key = account_key_for(account_id, account_type, bridge_id)
             existing = configs.get(account_key)
+            # Older clients may omit mode when editing an existing binding.
+            # Preserve its strategy selection instead of silently choosing ctypes.
+            mode = normalize_transport_mode(mode or (existing or {}).get("mode") or "ctypes")
+            if mode == "lttx" and enabled is not False:
+                if not qmt_dir:
+                    raise ValueError("高级模式需要填写普通 QMT 核心目录")
+                if not qmt_trade_dir:
+                    raise ValueError("高级模式需要填写极速交易端 QMT 核心目录")
+                if os.path.normcase(str(qmt_root(qmt_dir))) == os.path.normcase(str(qmt_root(qmt_trade_dir))):
+                    raise ValueError("高级模式的两个 QMT 核心目录必须不同")
+            if mode != "lttx":
+                qmt_trade_dir = ""
             strategy_settings = normalize_strategy_settings(
                 qmt_strategy if qmt_strategy is not None else (existing or {}).get("qmt_strategy")
             )
@@ -7883,6 +7874,7 @@ class CfquantUpdater(object):
                 source_path = os.path.abspath(os.path.join(source_root, "qmt_scripts", *entry_script.split("/")))
                 if not os.path.isfile(source_path):
                     raise RuntimeError("QMT entry script not found in update source: %s" % entry_script)
+                read_entry_source(source_path)
                 entry_file = os.path.abspath(os.path.join(script_dir, os.path.basename(entry_script)))
                 result["entry_file"] = entry_file
                 if file_content_equal(source_path, entry_file):
@@ -9942,7 +9934,7 @@ QMT_STRATEGIES = QmtStrategyManager(
 )
 
 
-def configure_account_qmt_strategies(row, identity):
+def configure_account_qmt_strategies(row, identity, source_dir=None, force=True):
     identities = [identity]
     if identity.get("trade_identity"):
         identities.append(identity["trade_identity"])
@@ -9951,7 +9943,10 @@ def configure_account_qmt_strategies(row, identity):
         QMT_STRATEGIES.reconcile(WEB_CONFIG.account_configs())
         # Explicit binding saves and updates must replace even an unchanged
         # managed slot with a newly built package for the selected mode.
-        return QMT_STRATEGIES.configure(row, identities, force=True)
+        return QMT_STRATEGIES.configure(
+            row, identities, force=force,
+            scripts_dir=os.path.join(source_dir or BASE_DIR, "qmt_scripts"),
+        )
     except Exception as error:
         detail = str(error or "").strip()
         if not detail or detail in ("策略部署失败", "error"):
@@ -10239,7 +10234,8 @@ def _qmt_entry_info_after_auto_sync(entry_info, deploy):
         for item in (deploy or {}).get("results", [])
         if isinstance(item, dict) and isinstance(item.get("entry_deploy"), dict)
     ]
-    if not results or any(item.get("error") for item in results):
+    if (not results or any(item.get("error") for item in results)
+            or (deploy or {}).get("summary", {}).get("ok") is False):
         return entry_info
     entry_info.update({
         "required": False,
@@ -10296,6 +10292,20 @@ def _auto_deploy_qmt_core_result_summary(results):
     }
 
 
+def _deploy_qmt_entry_for_target(result, target, source_dir=None):
+    entry_result = UPDATER.install_local_entry_script_to_qmt_dir(
+        target["qmt_dir"], entry_script=target["entry_script"],
+        bridge_id=target["bridge_id"], qmt_role=target["qmt_role"],
+        account_keys=target["account_keys"], source_dir=source_dir or BASE_DIR,
+    )
+    result.update(entry_deploy=entry_result, entry_script=target["entry_script"], mode=target["mode"])
+    if entry_result.get("error"):
+        result["error"] = entry_result["error"]
+        result["message"] = entry_result.get("message") or result.get("message")
+    elif entry_result.get("updated"):
+        result["entry_updated"] = True
+
+
 def auto_deploy_qmt_core_for_account(row, enabled=True):
     row = row or {}
     enabled = parse_config_bool(enabled, True)
@@ -10313,6 +10323,9 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
         except Exception:
             resolved_dir = qmt_dir
         key = os.path.normcase(os.path.abspath(os.path.normpath(resolved_dir)))
+        mode = normalize_transport_mode(row.get("mode") or "ctypes")
+        entry_script = qmt_entry_script_name_for_target(mode, qmt_role, market)
+        key = (key, entry_script)
         for target in targets:
             if target["key"] == key:
                 if account_keys:
@@ -10327,6 +10340,8 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
             "bridge_id": normalize_bridge_id(bridge_id or row.get("bridge_id") or DEFAULT_BRIDGE_ID),
             "account_keys": list(account_keys or []),
             "market": market,
+            "mode": mode,
+            "entry_script": entry_script,
         })
 
     account_key = str(row.get("account_key") or "").strip()
@@ -10402,6 +10417,7 @@ def auto_deploy_qmt_core_for_account(row, enabled=True):
                 qmt_role=target.get("qmt_role") or "normal",
                 account_keys=target.get("account_keys") or [],
             )
+            _deploy_qmt_entry_for_target(result, target)
             if target.get("market"):
                 result["market"] = target.get("market")
             results.append(result)
@@ -11341,9 +11357,8 @@ def start_configured_qmt_on_web_startup():
 def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=False):
     """Copy the current core into every distinct QMT directory in saved bindings.
 
-    Full project updates can also request the mode-specific entry script to be
-    replaced in the target QMT ``python`` directory.  Account-binding saves
-    keep the historical core-only behavior unless explicitly requested.
+    Full updates also replace raw entry files and rebuild managed import
+    packages. Plain startup core sync leaves entries to the strategy manager.
     """
     configs = WEB_CONFIG.account_configs() if WEB_CONFIG is not None else {}
     targets = []
@@ -11361,6 +11376,10 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
         except Exception:
             resolved_dir = qmt_dir
         key = os.path.normcase(os.path.abspath(os.path.normpath(resolved_dir)))
+        mode = normalize_transport_mode(row.get("mode") or "ctypes")
+        entry_script = qmt_entry_script_name_for_target(mode, qmt_role, market)
+        if sync_entry_scripts:
+            key = (key, entry_script)
         account_key = str(row.get("account_key") or "").strip()
         if key in seen:
             if account_key and account_key not in seen[key]["account_keys"]:
@@ -11373,12 +11392,10 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
             "bridge_id": normalize_bridge_id(bridge_id or row.get("bridge_id") or DEFAULT_BRIDGE_ID),
             "account_keys": [account_key] if account_key else [],
             "market": market,
-            "mode": normalize_transport_mode(row.get("mode") or "ctypes"),
+            "mode": mode,
         }
         if sync_entry_scripts:
-            target["entry_script"] = qmt_entry_script_name_for_target(
-                target["mode"], target["qmt_role"], market=market,
-            )
+            target["entry_script"] = entry_script
         seen[key] = target
         targets.append(target)
 
@@ -11441,26 +11458,14 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
             source_dir=source_dir or BASE_DIR,
         )
         if sync_entry_scripts and target.get("entry_script"):
-            entry_result = UPDATER.install_local_entry_script_to_qmt_dir(
-                target["qmt_dir"],
-                entry_script=target["entry_script"],
-                bridge_id=target["bridge_id"],
-                qmt_role=target["qmt_role"],
-                account_keys=target["account_keys"],
-                source_dir=source_dir or BASE_DIR,
-            )
-            result["entry_deploy"] = entry_result
-            result["entry_script"] = target["entry_script"]
-            if entry_result.get("error"):
-                result["error"] = entry_result.get("error")
-                result["message"] = entry_result.get("message") or result.get("message")
-            elif entry_result.get("updated"):
-                result["entry_updated"] = True
+            _deploy_qmt_entry_for_target(result, target, source_dir)
         if target.get("market"):
             result["market"] = target["market"]
         results.append(result)
 
     identity_results = sync_qmt_bridge_identities() if targets else []
+    strategy_results = refresh_bound_qmt_strategies(source_dir, force=True) if sync_entry_scripts else []
+    strategy_errors = [item for item in strategy_results if item.get("error")]
     summary = _auto_deploy_qmt_core_result_summary(results)
     identity_errors = [
         item for item in identity_results
@@ -11469,7 +11474,8 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
     summary.update({
         "target_count": len(targets),
         "identity_error_count": len(identity_errors),
-        "ok": bool(summary.get("ok", True) and not identity_errors),
+        "strategy_error_count": len(strategy_errors),
+        "ok": bool(summary.get("ok", True) and not identity_errors and not strategy_errors),
     })
     if not targets:
         summary["message"] = "未配置 QMT 绑定目录，Web 已更新；绑定 QMT 后会自动同步核心包"
@@ -11478,14 +11484,39 @@ def auto_deploy_qmt_core_for_all_accounts(source_dir=None, sync_entry_scripts=Fa
             summary.get("message") or "核心包同步完成",
             len(identity_errors),
         )
+    if strategy_errors:
+        summary["message"] += "；托管策略同步失败：" + "；".join(item["error"] for item in strategy_errors)
     return {
         "enabled": True,
         "source_dir": normalize_optional_path(source_dir or BASE_DIR),
         "target_count": len(targets),
         "results": results,
         "identity_results": identity_results,
+        "strategy_results": strategy_results,
         "summary": summary,
     }
+
+
+def refresh_bound_qmt_strategies(source_dir=None, force=False):
+    """Rebuild actual import packages, including upgrades run by older Web code."""
+    results = []
+    configs = WEB_CONFIG.account_configs() if WEB_CONFIG is not None else {}
+    for row in configs.values():
+        if (not isinstance(row, dict) or not account_config_is_enabled(row)
+                or not (row.get("qmt_strategy") or {}).get("enabled")):
+            continue
+        try:
+            identity = write_qmt_bridge_identity(row)
+            identity["market_identities"] = write_qmt_market_bridge_identities(row)
+            result = configure_account_qmt_strategies(row, identity, source_dir=source_dir, force=force)
+            errors = [target.get("error") for target in result.get("targets", []) if target.get("error")]
+            if errors and not result.get("error"):
+                result["error"] = "；".join(errors)
+        except Exception as error:
+            result = {"error": str(error)}
+        result["account_key"] = row["account_key"]
+        results.append(result)
+    return results
 
 
 def sync_qmt_bridge_identities():
@@ -13939,7 +13970,7 @@ def save_account_runtime_config(body):
         or body.get("advanced_qmt_dir")
         or body.get("qmt_trade_core_dir")
     )
-    mode = body.get("mode") or body.get("transport_mode") or "ctypes"
+    mode = body.get("mode") or body.get("transport_mode")
     market_bridges = body.get("market_bridges") if "market_bridges" in body else body.get("market_routes") if "market_routes" in body else None
     market_routing_enabled = body.get("market_routing_enabled") if "market_routing_enabled" in body else None
     account_enabled = parse_config_bool(body.get("enabled"), True) if "enabled" in body else None
@@ -14153,7 +14184,7 @@ def initialize_web_setup(body):
             or body.get("advanced_qmt_dir")
             or body.get("qmt_trade_core_dir")
         ),
-        mode=body.get("mode") or "ctypes",
+        mode=body.get("mode") or body.get("transport_mode"),
         data_provider=True,
         enabled=True,
         market_routing_enabled=body.get("market_routing_enabled") if "market_routing_enabled" in body else None,
@@ -17186,6 +17217,11 @@ def main(argv=None):
             % args.port
         )
     ensure_lttx_started("Web 启动预启动")
+    # Older updater processes only copied raw entries. Refresh managed sources
+    # before auto-login so QMT imports the selected mode's current package.
+    for result in refresh_bound_qmt_strategies():
+        if result.get("error"):
+            safe_print("cfquant managed QMT strategy refresh failed: %s" % result["error"])
     start_configured_qmt_on_web_startup()
     server = ThreadingHTTPServer((args.host, args.port), CfquantWebHandler)
     try:
